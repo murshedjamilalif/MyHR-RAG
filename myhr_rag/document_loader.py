@@ -26,6 +26,7 @@ def extract_policy_category(text: str) -> str:
     """Every policy file starts with a 'Policy Category: X' line (HR docs)
     or a 'Category: X' line (noise docs) — pull whichever is present out.
     Shared with processor.py (05)."""
+    
     for line in text.splitlines()[:5]:
         stripped = line.strip().lower()
         if stripped.startswith("policy category:"):
@@ -44,23 +45,25 @@ def load_documents_from_gcs(
     """List and download every .txt file under the given GCS prefix,
     returning one LangChain Document per file with source + category
     metadata."""
+
+    # create a client to connect to the GCS bucket
     client = storage.Client(project=config.PROJECT_ID)
     bucket = client.bucket(bucket_name)
 
+    # list all the files in the bucket with the given prefix
     documents = []
     for blob in bucket.list_blobs(prefix=prefix):
         if not blob.name.endswith(".txt"):
             continue
-        text = blob.download_as_text()
+        text = blob.download_as_text() # download the text content of the file
         filename = blob.name.rsplit("/", 1)[-1]
-        documents.append(Document(
-            page_content=text,
-            metadata={
-                "source": filename,
-                "policy_category": extract_policy_category(text),
-                "gcs_path": f"gs://{bucket_name}/{blob.name}",
-            },
-        ))
+        # create a new document with the text content and the metadata
+        documents.append(Document(page_content=text, metadata={
+            "source": filename,
+            "policy_category": extract_policy_category(text),
+            "gcs_path": f"gs://{bucket_name}/{blob.name}",
+        }))
+    # return the list of documents  -> list of documents is a list of Document objects
     return documents
 
 
@@ -78,7 +81,7 @@ def load_processed_documents_from_gcs(
     bucket = client.bucket(bucket_name)
 
     documents = []
-    for prefix in prefixes:
+    for prefix in prefixes: # prefixes is a tuple of two strings "hr_policies/processed/" and "noise_policies/processed/"
         for blob in bucket.list_blobs(prefix=prefix):
             if not blob.name.endswith(".json"):
                 continue
