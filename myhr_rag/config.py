@@ -49,8 +49,9 @@ QDRANT_NOISY_COLLECTION_NAME = os.getenv("QDRANT_NOISY_COLLECTION_NAME", "hr_pol
 ## MODELS
 # All three are env-overridable so a model swap needs no code change.
 
-# gemini-2.5-flash retires ~2026-10-20 (verified Sept 2026) — set
-# LLM_MODEL_NAME to a Gemini 3.x Flash model before then. Current IDs:
+# Default Gemini 3.5 Flash is NOT in us-central1 — pair with LOCATION=global
+# (or us / eu). For Iowa only, set LLM_MODEL_NAME=gemini-2.5-flash
+# (retires ~2026-10-20). IDs:
 # https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versions
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemini-3.5-flash")
 

@@ -160,10 +160,12 @@ Steps will be filled in as we go. Current shape:
 3. `gcloud` on PATH, project `myhr-rag`, ADC + CLI login
    ([commands/gcp-project.md](commands/gcp-project.md)).
 4. Qdrant Cloud cluster healthy; `QDRANT_URL` + `QDRANT_API_KEY` in `.env`.
-5. From **repo root:** `python ingest.py --force`.
+5. Enable Vertex AI: `gcloud services enable aiplatform.googleapis.com --project=myhr-rag`
+6. From **repo root:** `python ingest.py --force`, then `python main.py`.
 
 `.env` needs: `PROJECT_ID`, `LOCATION`, `GCS_BUCKET_NAME`, `JINA_API_KEY`,
-`QDRANT_URL`, `QDRANT_API_KEY`. LangSmith is optional.
+`QDRANT_URL`, `QDRANT_API_KEY`. For **`gemini-3.5-flash`** use
+`LOCATION=global` (it is not in `us-central1`). LangSmith is optional.
 
 Windows `gcloud` PATH, Git Bash vs PowerShell, and region knobs:
 [commands/gcp-project.md](commands/gcp-project.md) ·
@@ -175,7 +177,8 @@ Windows `gcloud` PATH, Git Bash vs PowerShell, and region knobs:
 
 ```
 MyHR/
-  ingest.py                 # run from here: python ingest.py
+  ingest.py                 # python ingest.py  (repo root)
+  main.py                   # CLI demo
   data/                     # HR .txt + data/noise/
   Images/                   # architecture diagrams (this README)
   myhr_rag/
@@ -188,6 +191,12 @@ MyHR/
     embeddings.py           # 07  Jina
     vector_store.py         # 08  Qdrant hybrid
     ingestion.py            # 09  orchestrates 04–08
+    reranker.py             # 10
+    tools.py                # 11  search_hr_policy
+    llm.py                  # 12  Vertex Gemini
+    agent.py                # 13
+    pipeline.py             # 14  ask()
+    tracing.py              # 15  LangSmith
     SEQUENCE.md             # numbered reading order
   commands/                 # gcloud, git, provisioning notes
 ```
