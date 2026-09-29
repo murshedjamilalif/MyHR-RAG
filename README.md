@@ -1,212 +1,237 @@
 # MyHR-RAG
 
-An HR-policy assistant: employees ask in chat, the system **retrieves** the
-right policy chunks, **re-ranks** them, and **Gemini** writes a cited answer.
+**Ask an HR-policy question. Get an answer grounded in your documents, with a citation.**
 
-This repo is built in **three branches**. You are looking at **`basic-rag`**
-(ingestion + query). Guardrails, cache, eval, and Cloud Run come later.
+The assistant does not invent policy. It **searches** Qdrant, **re-ranks** with Jina, then **Gemini** writes from those chunks only.
 
-| Branch | What it adds |
+| | |
 |---|---|
-| **`basic-rag`** *(this branch)* | Ingestion → hybrid search → re-rank → agent → cited answer |
-| `ai-security` | Model Armor, semantic cache, scope filter, evaluation, Groq fallback |
-| `deployment` | Docker, Cloud Run, Google OAuth, Secret Manager |
+| **Now (`basic-rag`)** | Ingest policies → hybrid search → re-rank → agent → cited answer (CLI + Streamlit) |
+| **Next (`ai-security`)** | Model Armor, semantic cache, category filter, eval, Groq fallback |
+| **Later (`deployment`)** | Docker, Cloud Run, Google OAuth, Secret Manager |
+
+Repo: [murshedjamilalif/MyHR-RAG](https://github.com/murshedjamilalif/MyHR-RAG) · work on branch **`basic-rag`**
 
 ---
 
-## Architecture (overall)
+## Why this exists
 
-Three layers. Ingestion is **offline and one-time**. Every question at runtime
-hits Qdrant + Jina + Vertex — not the raw files on disk.
-
-![Overall architecture — user access, Cloud Run, external services](Images/6.png)
-
-### Layer 1 — User access *(deployment branch)*
-
-Employee browser → **Google OAuth** + allow-list → Secret Manager holds the
-Streamlit auth secret. Not wired on `basic-rag`.
-
-### Layer 2 — App *(inside Cloud Run later; local Streamlit for now)*
+HR policies live as files (leave, WFH, notice, maternity, …). People ask in plain language. A raw LLM will guess. This project **indexes** the files once, then at question time **retrieves** the right passages so the model can only speak from evidence.
 
 ```
-Chat UI
-  → input guardrail (Model Armor)     ← ai-security
-  → semantic cache                    ← ai-security
-  → Guarded Agent
-        search tool + LiteLLM router
-  → output guardrail                  ← ai-security
-  → Chat UI
+You:  How many paid annual leave days do I get?
+App:  search_hr_policy  →  12 candidates  →  top 5 after Jina
+      Gemini writes from those 5 chunks  →  answer + [Source: leave_policy.txt]
 ```
-
-On **this branch** the path is shorter: **UI → agent → search tool → Gemini**.
-No guardrails, no cache, no Groq fallback yet.
-
-### Layer 3 — External cloud services
-
-| Service | Role |
-|---|---|
-| **Cloud Storage** | Policy files (raw + processed JSON) |
-| **Qdrant Cloud** | Vector store (hybrid dense + BM25) |
-| **Jina AI** | Embeddings at ingest; reranker at query time |
-| **Vertex AI Gemini** | Writes the answer from retrieved chunks only |
-| **Groq** | Fallback LLM *(ai-security)* |
-| **LangSmith** | Traces and evaluation *(optional / later)* |
-
-Ingestion (dashed orange on the diagram) is the only path that **writes**
-Qdrant. The chat app only **reads**.
 
 ---
 
-## Data ingestion pipeline
+## Architecture
 
-Runs **once** via `ingest.py`. Idempotent: collections that already have
-points are skipped unless you pass `--force`. This is the **only** writer to
-Qdrant.
+Three layers. **Ingestion is offline and one-time.** Chat never uploads files; it only reads Qdrant.
 
-![Data ingestion pipeline — six stages from local files to Qdrant](Images/1.png)
+<p align="center">
+  <img src="Images/6.png" alt="Overall architecture: user access, Cloud Run app, GCS / Qdrant / Jina / Gemini" width="100%">
+</p>
 
-| Step | What happens | This repo |
+| Layer | What it is | On this branch |
 |---|---|---|
-| **1** | Local `data/` — 10 HR `.txt` policies + 8 noise docs (pdf / docx / pptx / txt) | `data/` and `data/noise/` |
-| **2** | Upload to GCS **raw** zone | `raw/myhr-rag-data/` and `raw/other-data/` |
-| **3** | Parse pdf/docx/pptx **once** → one JSON per document (`text` + `policy_category`) | `processed/…` via `processor.py` |
-| **4** | Chunk — **500** characters, **60** overlap | `splitter.py` |
-| **5** | Jina `jina-embeddings-v2-base-en` → **768-dim** vectors | `embeddings.py` |
-| **6** | Upsert hybrid (dense + BM25 sparse) into **two** Qdrant collections | `vector_store.py` |
+| **1 · User access** | Browser → Google OAuth → email allow-list | Not yet (`deployment`) |
+| **2 · App** | Streamlit + agent (+ later guardrails and cache) | Agent + **CLI** (`main.py`) + **Streamlit** (`app.py`) |
+| **3 · Cloud** | GCS, Qdrant, Jina, Vertex Gemini, optional LangSmith | **Yes** — ingest + query |
 
-| Collection | Contents | Who uses it |
+Dashed orange on the diagram: **ingest** (the only writer to Qdrant). Solid arrows at runtime: **retrieve → rerank → generate**.
+
+<details>
+<summary>What each cloud service does</summary>
+
+| Service | Job |
+|---|---|
+| **Cloud Storage** (`gs://myhr-rag`) | Raw files + processed JSON |
+| **Qdrant Cloud** | Hybrid search: dense vectors + BM25 keywords |
+| **Jina** | Embed at ingest; rerank at query time |
+| **Vertex AI Gemini** | Write the answer (`temperature=0`) |
+| **Groq** | Fallback LLM — `ai-security` |
+| **LangSmith** | Traces / eval — optional |
+
+Gemini **does not** read the bucket. It only sees retrieved chunk text.
+
+</details>
+
+---
+
+## Ingestion (run once)
+
+`ingest.py` is the **only** writer to Qdrant. Collections that already have points are skipped unless you pass `--force`.
+
+<p align="center">
+  <img src="Images/1.png" alt="Six-step data ingestion from local data/ to Qdrant" width="100%">
+</p>
+
+| # | Stage | Detail |
 |---|---|---|
-| `myhr-rag-data` | Clean HR policies | the app |
-| `hr_policies_noisy_data` | HR + non-HR noise mixed | later retrieval / noise tests |
+| 1 | Local `data/` | 10 HR `.txt` policies + 8 noise docs (pdf / docx / pptx / txt) |
+| 2 | GCS **raw** | `raw/myhr-rag-data/` (HR) and `raw/other-data/` (noise) |
+| 3 | GCS **processed** | Parse binaries **once** → one JSON per file (`text`, `policy_category`) |
+| 4 | Chunk | **500** characters, **60** overlap (`splitter.py`) |
+| 5 | Embed | Jina `jina-embeddings-v2-base-en` → **768-dim** vectors |
+| 6 | Upsert | Hybrid dense + BM25 into **two** Qdrant collections |
 
-GCS bucket name is `myhr-rag` (same as the GCP project ID). Region for the
-bucket is set at **create** time (`--location=us-central1`). `.env`
-`LOCATION` is **Vertex AI / Gemini**, not the bucket.
+| Collection | What is in it | Used by |
+|---|---|---|
+| `myhr-rag-data` | Clean HR only | The assistant |
+| `hr_policies_noisy_data` | HR + noise mixed | Later retrieval tests |
 
-Code map for this diagram:
-
-```
-data/  →  upload_corpus_to_gcs()     ingestion.py
-       →  process_raw_to_json()      processor.py
-       →  load + split + embed       document_loader / splitter / embeddings
-       →  build_vector_store()       vector_store.py
-```
+Bucket **name** = project ID = `myhr-rag`. Bucket **region** is set only when you create it (`--location=us-central1`). That is not `.env` `LOCATION`.
 
 ```bash
-# from the repo root (not from inside myhr_rag/)
+# always from the repo root, not from myhr_rag/
 python ingest.py              # skip collections that already have data
 python ingest.py --force      # rebuild both
 python ingest.py --hr-only
 python ingest.py --noisy-only
-python ingest.py --no-upload  # Qdrant only; GCS already uploaded
+python ingest.py --no-upload  # Qdrant only (GCS already uploaded)
 ```
 
 ---
 
-## RAG query pipeline *(basic-rag)*
+## Query path (this branch)
 
-No guardrails, no cache, no fallback model on this branch.
+No guardrails, no cache, no Groq. Agent + search + Gemini.
 
-![RAG query pipeline — agent, hybrid retrieve, Jina rerank, Gemini](Images/2.png)
+<p align="center">
+  <img src="Images/2.png" alt="RAG query: agent, hybrid retrieve, Jina rerank, Gemini" width="100%">
+</p>
 
-1. User asks in **CLI** (`main.py`) or **Streamlit** (`app.py`).
-2. LangChain agent (`create_agent` + `InMemorySaver` memory) always calls
-   **`search_hr_policy`** first.
-3. Qdrant **hybrid retrieve** — wide shortlist, `RERANK_CANDIDATE_K = 12`.
-4. Jina reranker (`jina-reranker-v2-base-multilingual`) — keep
-   `TOP_K_RESULTS = 5`.
-5. Cited chunks: `[Source: filename]` + text.
-6. **Vertex Gemini** writes the answer from **those chunks only**
-   (`temperature=0`). Optional **LangSmith** traces.
+1. You run **`python main.py`** (five demo HR questions) or **`streamlit run app.py`**.
+2. The agent **always** calls `search_hr_policy` before answering.
+3. Qdrant hybrid retrieve — **12** candidates (`RERANK_CANDIDATE_K`).
+4. Jina `jina-reranker-v2-base-multilingual` — keep **5** (`TOP_K_RESULTS`).
+5. Chunks formatted as `[Source: filename]` + text.
+6. **Gemini 3.5 Flash** (`LOCATION=global`) writes from those chunks only.
 
-Gemini does **not** read the GCS bucket. It only sees what retrieval returned.
-
----
-
-## What comes next (other branches)
-
-These diagrams are the target design. They are **not** implemented on
-`basic-rag`.
-
-### Secure query pipeline — Phase 2 (`ai-security`)
-
-![Secure RAG query pipeline — guardrails, cache, routing](Images/3.png)
-
-Input Model Armor → semantic cache → agent (category filter + rerank +
-LiteLLM Gemini / Groq fallback) → output Model Armor → cache store.
-
-### Answer-quality evaluation
-
-![LLM-as-judge evaluation on LangSmith](Images/4.png)
-
-Hand-written Q&A pairs, same search path as the app, Groq judge for
-**correctness** and **groundedness** on LangSmith.
-
-### Build & deploy — Phase 3 (`deployment`)
-
-![Build, Cloud Run, OAuth session](Images/5.png)
-
-`gcloud run deploy --source .` → Artifact Registry → Cloud Run → secrets.
-Each user: URL → Google OAuth → email allow-list → chat.
+Demo questions in `main.py` include annual leave, notice during probation, WFH, leave in notice, maternity leave.
 
 ---
 
-## Setup
+## Roadmap diagrams (not on `basic-rag` yet)
 
-Steps will be filled in as we go. Current shape:
+<details>
+<summary>Phase 2 — Secure query (`ai-security`)</summary>
 
-1. Copy `.env.example` → `.env` and fill keys (never commit `.env`).
-2. `uv venv` + `uv pip install -r requirements.txt`.
-3. `gcloud` on PATH, project `myhr-rag`, ADC + CLI login
-   ([commands/gcp-project.md](commands/gcp-project.md)).
-4. Qdrant Cloud cluster healthy; `QDRANT_URL` + `QDRANT_API_KEY` in `.env`.
-5. Enable Vertex AI: `gcloud services enable aiplatform.googleapis.com --project=myhr-rag`
-6. From **repo root:** `python ingest.py --force`, then `python main.py`.
+<p align="center">
+  <img src="Images/3.png" alt="Guardrails, semantic cache, LiteLLM routing" width="100%">
+</p>
 
-`.env` needs: `PROJECT_ID`, `LOCATION`, `GCS_BUCKET_NAME`, `JINA_API_KEY`,
-`QDRANT_URL`, `QDRANT_API_KEY`. For **`gemini-3.5-flash`** use
-`LOCATION=global` (it is not in `us-central1`). LangSmith is optional.
+Input Model Armor → cache → agent (category filter + rerank + Gemini / Groq) → output Model Armor → cache store.
 
-Windows `gcloud` PATH, Git Bash vs PowerShell, and region knobs:
-[commands/gcp-project.md](commands/gcp-project.md) ·
-[commands/github.md](commands/github.md).
+</details>
+
+<details>
+<summary>Evaluation — LLM-as-judge</summary>
+
+<p align="center">
+  <img src="Images/4.png" alt="LangSmith evaluation with Groq judge" width="100%">
+</p>
+
+Hand-written Q&A, same retrieval path, Groq scores **correctness** and **groundedness**.
+
+</details>
+
+<details>
+<summary>Phase 3 — Deploy (`deployment`)</summary>
+
+<p align="center">
+  <img src="Images/5.png" alt="Cloud Run build and OAuth session" width="100%">
+</p>
+
+`gcloud run deploy --source .` → Artifact Registry → Cloud Run → secrets. Users: URL → Google login → allow-list → chat.
+
+</details>
 
 ---
 
-## Repository map
+## Quick start
 
-```
-MyHR/
-  ingest.py                 # python ingest.py  (repo root)
-  main.py                   # CLI demo
-  data/                     # HR .txt + data/noise/
-  Images/                   # architecture diagrams (this README)
-  myhr_rag/
-    config.py               # 01  .env
-    prompts.py              # 02  system prompt
-    logging_config.py       # 03
-    document_loader.py      # 04  GCS → LangChain Documents
-    processor.py            # 05  pdf/docx/pptx → JSON
-    splitter.py             # 06  chunks 500 / 60
-    embeddings.py           # 07  Jina
-    vector_store.py         # 08  Qdrant hybrid
-    ingestion.py            # 09  orchestrates 04–08
-    reranker.py             # 10
-    tools.py                # 11  search_hr_policy
-    llm.py                  # 12  Vertex Gemini
-    agent.py                # 13
-    pipeline.py             # 14  ask()
-    tracing.py              # 15  LangSmith
-    SEQUENCE.md             # numbered reading order
-  commands/                 # gcloud, git, provisioning notes
+Need: a GCP project **`myhr-rag`** with billing, a GCS bucket, a **running** Qdrant Cloud cluster, a [Jina](https://jina.ai) key, and `gcloud` on your PATH.
+
+```bash
+git clone https://github.com/murshedjamilalif/MyHR-RAG.git
+cd MyHR-RAG
+git checkout basic-rag
+
+cp .env.example .env          # fill in real keys — never commit .env
+uv venv && uv pip install -r requirements.txt
+
+gcloud config set project myhr-rag
+gcloud auth application-default login
+gcloud auth application-default set-quota-project myhr-rag
+gcloud auth login
+gcloud services enable aiplatform.googleapis.com storage.googleapis.com --project=myhr-rag
+
+python ingest.py --force      # from repo root
+python main.py
+streamlit run app.py
 ```
 
-Reading order for the Python package: [myhr_rag/SEQUENCE.md](myhr_rag/SEQUENCE.md).
+### `.env` that must be right
+
+| Variable | Meaning |
+|---|---|
+| `PROJECT_ID` | `myhr-rag` |
+| `LOCATION` | **`global`** for `gemini-3.5-flash` (not `us-central1`) |
+| `LLM_MODEL_NAME` | `gemini-3.5-flash` |
+| `REGION` | `us-central1` — Cloud Run later; does not move the bucket |
+| `GCS_BUCKET_NAME` | `myhr-rag` (name only) |
+| `JINA_API_KEY` | Jina embeddings + reranker |
+| `QDRANT_URL` | REST URL, usually `https://….cloud.qdrant.io:6333` |
+| `QDRANT_API_KEY` | Qdrant API key |
+
+LangSmith (`LANGSMITH_TRACING`, `LANGSMITH_API_KEY`) is optional.
+
+Windows PATH, Git Bash vs PowerShell, ADC vs `gcloud auth login`: [commands/gcp-project.md](commands/gcp-project.md). Git commands: [commands/github.md](commands/github.md).
 
 ---
 
-## Stack
+## If something breaks
 
-Python 3.12 · **uv** · LangChain / LangGraph · Vertex AI Gemini ·
-Google Cloud Storage · Qdrant Cloud · Jina embeddings + reranker · Streamlit
-(planned on this branch) · LangSmith (optional)
+| Symptom | Cause | What to do |
+|---|---|---|
+| `No module named 'myhr_rag'` | Ran `python ingest.py` **inside** `myhr_rag/` | `cd` to repo root |
+| Qdrant `WinError 10054` / TLS closed | Cluster paused or bad URL/key | Wake cluster in [Qdrant Cloud](https://cloud.qdrant.io); check `.env` |
+| Gemini **403** `SERVICE_DISABLED` | Vertex API off | `gcloud services enable aiplatform.googleapis.com --project=myhr-rag` |
+| Gemini **404** `gemini-3.5-flash` in `us-central1` | That model is not in Iowa | `LOCATION=global` (or use `gemini-2.5-flash` in Iowa until 20 Oct 2026) |
+
+---
+
+## Code map
+
+Read Python in number order: [myhr_rag/SEQUENCE.md](myhr_rag/SEQUENCE.md).
+
+```
+MyHR-RAG/
+├── ingest.py                 # write Qdrant (run from here)
+├── main.py                   # CLI demo
+├── app.py                    # Streamlit chat UI
+├── data/                     # HR policies + data/noise/
+├── Images/                   # diagrams on this page
+├── commands/                 # gcloud / git notes
+└── myhr_rag/
+    ├── 01  config.py
+    ├── 02  prompts.py
+    ├── 03  logging_config.py
+    ├── 04  document_loader.py
+    ├── 05  processor.py
+    ├── 06  splitter.py
+    ├── 07  embeddings.py
+    ├── 08  vector_store.py
+    ├── 09  ingestion.py
+    ├── 10  reranker.py
+    ├── 11  tools.py
+    ├── 12  llm.py
+    ├── 13  agent.py
+    ├── 14  pipeline.py
+    └── 15  tracing.py
+```
+
+**Stack:** Python 3.12 · uv · LangChain / LangGraph · Vertex AI Gemini 3.5 Flash · Cloud Storage · Qdrant Cloud · Jina · Streamlit · LangSmith (optional)
