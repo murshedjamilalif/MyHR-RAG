@@ -1,284 +1,203 @@
-# HR Policy Assistant — Basic RAG
+# MyHR-RAG
 
-> **This is the `basic-rag` branch — stage 1 of 3.**
-> A plain, working RAG agent: ingestion, hybrid search, re-ranking, an
-> agent with memory, a CLI and a Streamlit UI, LangGraph Studio. No
-> guardrails, no evaluation, no deployment — those come next.
->
-> | Branch | Adds |
-> |---|---|
-> | **`basic-rag`** *(here)* | the RAG pipeline end to end |
-> | `security` | safety guardrails, scope filter, semantic cache, evaluation, red-team, LLM fallback |
-> | `deployment` | Docker, Cloud Run, Google OAuth |
+An HR-policy assistant: employees ask in chat, the system **retrieves** the
+right policy chunks, **re-ranks** them, and **Gemini** writes a cited answer.
 
-A RAG agent that answers HR-policy questions from real policy documents —
-retrieval, metadata plumbing, hybrid (dense + BM25) search, and Jina
-re-ranking for grounded, cited answers. The model is Vertex AI Gemini.
+This repo is built in **three branches**. You are looking at **`basic-rag`**
+(ingestion + query). Guardrails, cache, eval, and Cloud Run come later.
 
-## Quick start
+| Branch | What it adds |
+|---|---|
+| **`basic-rag`** *(this branch)* | Ingestion → hybrid search → re-rank → agent → cited answer |
+| `ai-security` | Model Armor, semantic cache, scope filter, evaluation, Groq fallback |
+| `deployment` | Docker, Cloud Run, Google OAuth, Secret Manager |
+
+---
+
+## Architecture (overall)
+
+Three layers. Ingestion is **offline and one-time**. Every question at runtime
+hits Qdrant + Jina + Vertex — not the raw files on disk.
+
+![Overall architecture — user access, Cloud Run, external services](Images/6.png)
+
+### Layer 1 — User access *(deployment branch)*
+
+Employee browser → **Google OAuth** + allow-list → Secret Manager holds the
+Streamlit auth secret. Not wired on `basic-rag`.
+
+### Layer 2 — App *(inside Cloud Run later; local Streamlit for now)*
+
+```
+Chat UI
+  → input guardrail (Model Armor)     ← ai-security
+  → semantic cache                    ← ai-security
+  → Guarded Agent
+        search tool + LiteLLM router
+  → output guardrail                  ← ai-security
+  → Chat UI
+```
+
+On **this branch** the path is shorter: **UI → agent → search tool → Gemini**.
+No guardrails, no cache, no Groq fallback yet.
+
+### Layer 3 — External cloud services
+
+| Service | Role |
+|---|---|
+| **Cloud Storage** | Policy files (raw + processed JSON) |
+| **Qdrant Cloud** | Vector store (hybrid dense + BM25) |
+| **Jina AI** | Embeddings at ingest; reranker at query time |
+| **Vertex AI Gemini** | Writes the answer from retrieved chunks only |
+| **Groq** | Fallback LLM *(ai-security)* |
+| **LangSmith** | Traces and evaluation *(optional / later)* |
+
+Ingestion (dashed orange on the diagram) is the only path that **writes**
+Qdrant. The chat app only **reads**.
+
+---
+
+## Data ingestion pipeline
+
+Runs **once** via `ingest.py`. Idempotent: collections that already have
+points are skipped unless you pass `--force`. This is the **only** writer to
+Qdrant.
+
+![Data ingestion pipeline — six stages from local files to Qdrant](Images/1.png)
+
+| Step | What happens | This repo |
+|---|---|---|
+| **1** | Local `data/` — 10 HR `.txt` policies + 8 noise docs (pdf / docx / pptx / txt) | `data/` and `data/noise/` |
+| **2** | Upload to GCS **raw** zone | `raw/myhr-rag-data/` and `raw/other-data/` |
+| **3** | Parse pdf/docx/pptx **once** → one JSON per document (`text` + `policy_category`) | `processed/…` via `processor.py` |
+| **4** | Chunk — **500** characters, **60** overlap | `splitter.py` |
+| **5** | Jina `jina-embeddings-v2-base-en` → **768-dim** vectors | `embeddings.py` |
+| **6** | Upsert hybrid (dense + BM25 sparse) into **two** Qdrant collections | `vector_store.py` |
+
+| Collection | Contents | Who uses it |
+|---|---|---|
+| `myhr-rag-data` | Clean HR policies | the app |
+| `hr_policies_noisy_data` | HR + non-HR noise mixed | later retrieval / noise tests |
+
+GCS bucket name is `myhr-rag` (same as the GCP project ID). Region for the
+bucket is set at **create** time (`--location=us-central1`). `.env`
+`LOCATION` is **Vertex AI / Gemini**, not the bucket.
+
+Code map for this diagram:
+
+```
+data/  →  upload_corpus_to_gcs()     ingestion.py
+       →  process_raw_to_json()      processor.py
+       →  load + split + embed       document_loader / splitter / embeddings
+       →  build_vector_store()       vector_store.py
+```
 
 ```bash
-cp .env.example .env          # then fill in the values (see below)
-uv venv                       # creates .venv (Python 3.12)
-uv pip install -r requirements.txt
-
-# gcloud — see “Point gcloud at the GCP project” below for why
-gcloud --version
-gcloud config set project myhr-rag
-gcloud auth application-default login
-gcloud auth application-default set-quota-project myhr-rag
-
-uv run python ingest.py       # local data/ -> GCS -> Qdrant (run once)
-uv run python main.py         # CLI demo
-uv run streamlit run app.py   # chat UI
+# from the repo root (not from inside myhr_rag/)
+python ingest.py              # skip collections that already have data
+python ingest.py --force      # rebuild both
+python ingest.py --hr-only
+python ingest.py --noisy-only
+python ingest.py --no-upload  # Qdrant only; GCS already uploaded
 ```
+
+---
+
+## RAG query pipeline *(basic-rag)*
+
+No guardrails, no cache, no fallback model on this branch.
+
+![RAG query pipeline — agent, hybrid retrieve, Jina rerank, Gemini](Images/2.png)
+
+1. User asks in **CLI** (`main.py`) or **Streamlit** (`app.py`).
+2. LangChain agent (`create_agent` + `InMemorySaver` memory) always calls
+   **`search_hr_policy`** first.
+3. Qdrant **hybrid retrieve** — wide shortlist, `RERANK_CANDIDATE_K = 12`.
+4. Jina reranker (`jina-reranker-v2-base-multilingual`) — keep
+   `TOP_K_RESULTS = 5`.
+5. Cited chunks: `[Source: filename]` + text.
+6. **Vertex Gemini** writes the answer from **those chunks only**
+   (`temperature=0`). Optional **LangSmith** traces.
+
+Gemini does **not** read the GCS bucket. It only sees what retrieval returned.
+
+---
+
+## What comes next (other branches)
+
+These diagrams are the target design. They are **not** implemented on
+`basic-rag`.
+
+### Secure query pipeline — Phase 2 (`ai-security`)
+
+![Secure RAG query pipeline — guardrails, cache, routing](Images/3.png)
+
+Input Model Armor → semantic cache → agent (category filter + rerank +
+LiteLLM Gemini / Groq fallback) → output Model Armor → cache store.
+
+### Answer-quality evaluation
+
+![LLM-as-judge evaluation on LangSmith](Images/4.png)
+
+Hand-written Q&A pairs, same search path as the app, Groq judge for
+**correctness** and **groundedness** on LangSmith.
+
+### Build & deploy — Phase 3 (`deployment`)
+
+![Build, Cloud Run, OAuth session](Images/5.png)
+
+`gcloud run deploy --source .` → Artifact Registry → Cloud Run → secrets.
+Each user: URL → Google OAuth → email allow-list → chat.
+
+---
+
+## Setup
+
+Steps will be filled in as we go. Current shape:
+
+1. Copy `.env.example` → `.env` and fill keys (never commit `.env`).
+2. `uv venv` + `uv pip install -r requirements.txt`.
+3. `gcloud` on PATH, project `myhr-rag`, ADC + CLI login
+   ([commands/gcp-project.md](commands/gcp-project.md)).
+4. Qdrant Cloud cluster healthy; `QDRANT_URL` + `QDRANT_API_KEY` in `.env`.
+5. From **repo root:** `python ingest.py --force`.
 
 `.env` needs: `PROJECT_ID`, `LOCATION`, `GCS_BUCKET_NAME`, `JINA_API_KEY`,
-`QDRANT_URL`, `QDRANT_API_KEY`. `LANGSMITH_API_KEY` + `LANGSMITH_TRACING=true`
-are optional (request tracing).
+`QDRANT_URL`, `QDRANT_API_KEY`. LangSmith is optional.
 
-Full GCP provisioning (project, billing, APIs, bucket) is in
-[commands/commands-basic-rag.md](commands/commands-basic-rag.md).
-
----
-
-## Local setup (Windows)
-
-Python packages go in the project venv. `gcloud` does **not**.
-
-| Tool | What it is | Where it lives |
-|---|---|---|
-| **uv** | Python package/venv manager | system PATH |
-| **`.venv`** | Project Python environment (`(MyHR)` prompt) | `D:\CODE\AI\Projects\MyHR\.venv` |
-| **`gcloud`** | Google Cloud CLI (auth, project, buckets) | Windows install, **not** the venv |
-
-`requirements.txt` installs Python clients such as `google-cloud-storage`.
-Those are what the app imports. `gcloud config`, `gcloud auth`, and
-`gcloud storage` are shell commands — same idea as `git` or `uv`.
-
-### 1. uv + Python venv
-
-```powershell
-uv --version
-uv python install 3.12
-uv venv
-.venv\Scripts\activate
-uv pip install -r requirements.txt
-```
-
-Activate in **Command Prompt** with `.venv\Scripts\activate.bat`.
-Activate in **PowerShell** with `.venv\Scripts\activate`.
-
-After that the prompt shows `(MyHR)`. Run app code with `uv run …` (no
-need to activate) or with `python` / `streamlit` after activating.
-
-### 2. Install the Google Cloud CLI
-
-`gcloud` is a Windows program. Do **not** try to put it inside `.venv`.
-
-```powershell
-winget install Google.CloudSDK
-```
-
-If winget says the package is already installed (and may ask for
-`--include-unknown` to upgrade), that is fine — the CLI is already on
-disk. It still has to be on **PATH** or `gcloud` will fail:
-
-```
-'gcloud' is not recognized as an internal or external command
-```
-
-Typical install location:
-
-`C:\Users\USER\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin`
-
-Confirm it with the full path:
-
-```bat
-"%LOCALAPPDATA%\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd" --version
-```
-
-### 3. Put `gcloud` on PATH
-
-Use the syntax for **this** terminal. `$env:Path` is PowerShell only.
-In Command Prompt it is treated as a filename and you get
-`The filename, directory name, or volume label syntax is incorrect.`
-
-**Command Prompt (this session only):**
-
-```bat
-set PATH=%PATH%;%LOCALAPPDATA%\Google\Cloud SDK\google-cloud-sdk\bin
-gcloud --version
-```
-
-**PowerShell (this session only):**
-
-```powershell
-$env:Path += ";$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin"
-gcloud --version
-```
-
-**Permanent (User PATH)** — then close the terminal and open a new one:
-
-```powershell
-$gcloudBin = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin"
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*google-cloud-sdk\bin*") {
-  [Environment]::SetEnvironmentVariable("Path", "$userPath;$gcloudBin", "User")
-}
-```
-
-Or skip PATH and call `gcloud` by full path every time:
-
-```bat
-"%LOCALAPPDATA%\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd" config set project myhr-rag
-```
-
-### 4. Point gcloud at the GCP project
-
-This app talks to **Vertex AI (Gemini)** and **Cloud Storage** from Python
-(`google-cloud-storage`, `langchain-google-genai`). Those libraries do not
-use your gcloud login by magic — they look for **Application Default
-Credentials (ADC)** on disk. The commands below (1) pick the GCP project
-and (2) write those credentials so ingest and the agent can call Google
-APIs as you.
-
-Replace `myhr-rag` if your project ID is different.
-
-**Check the CLI is on PATH** — proves `gcloud` itself works (SDK 584+ is
-fine). This does not log you in.
-
-```powershell
-gcloud --version
-```
-
-Expected: `Google Cloud SDK …`, plus `bq`, `core`, `gsutil`.
-
-**Set the default project** — every later `gcloud` command, and the quota
-project attached to ADC, targets this ID. Without it, calls go to the
-wrong project or fail with “no project”.
-
-```powershell
-gcloud config set project myhr-rag
-```
-
-Expected: `Updated property [core/project].`
-
-**Application Default Credentials** — opens a browser OAuth flow. On
-success, credentials are saved to
-`%APPDATA%\gcloud\application_default_credentials.json`. **Python**
-(ingest, Streamlit, the agent) uses this file, not the `(MyHR)` venv.
-This is different from `gcloud auth login`, which only authenticates the
-**gcloud CLI** for commands you type. This project needs ADC because
-Vertex AI and Cloud Storage are called from Python.
-
-```powershell
-gcloud auth application-default login
-```
-
-Expected: browser sign-in, then `Credentials saved to file: […\application_default_credentials.json]`.
-Quota project `myhr-rag` may already be attached if the default project
-was set first.
-
-**Pin the quota / billing project on ADC** — client libraries send this
-project for **quota and billing**. Vertex AI and GCS need it even when
-ADC already exists; some APIs still fail without it.
-
-```powershell
-gcloud auth application-default set-quota-project myhr-rag
-```
-
-Expected: credentials saved again, and
-`Quota project "myhr-rag" was added to ADC…`
-
-**Log the gcloud CLI in** — ADC (above) is for Python. `gcloud billing`,
-`gcloud services enable`, and `gcloud storage` use a **separate** CLI
-login. Without it you get:
-
-`You do not currently have an active account selected.`
-
-```powershell
-gcloud auth login
-```
-
-Expected: browser sign-in, then `You are now logged in as [you@gmail.com]`
-and `Your current project is [myhr-rag]`.
-
-**Do not run `gcloud config set account ACCOUNT`.** `ACCOUNT` in Google’s
-error text is a **placeholder**. Pasting it sets the active account to the
-literal string `ACCOUNT`, which has no credentials:
-
-`Your current active account [ACCOUNT] does not have any valid credentials`
-
-Switch back to the email from `gcloud auth login` (not the word ACCOUNT):
-
-```powershell
-gcloud config set account murshedjamilalif@gmail.com
-```
-
-Expected: `Updated property [core/account].`
-
-**List billing accounts** — Vertex AI and Cloud Storage are not free at
-scale; a GCP project must be **linked** to an open billing account or
-API calls fail. This command is how you get the `ACCOUNT_ID` for
-`gcloud billing projects link`. It does not charge anything by itself.
-
-```powershell
-gcloud billing accounts list
-```
-
-Expected (this machine):
-
-```
-ACCOUNT_ID            NAME                OPEN  MASTER_ACCOUNT_ID
-01C1BA-71A95A-C16402  My Billing Account  True
-```
-
-- `ACCOUNT_ID` (`01C1BA-71A95A-C16402`) — pass this as
-  `$BILLING_ACCOUNT_ID` when linking the project.
-- `OPEN` must be `True` or the link will fail.
-- `MASTER_ACCOUNT_ID` empty is normal for a standalone account.
-
-Or run `gcloud auth login` again if the wrong account is still selected.
-Check with `gcloud auth list` — the active account has a `*`.
+Windows `gcloud` PATH, Git Bash vs PowerShell, and region knobs:
+[commands/gcp-project.md](commands/gcp-project.md) ·
+[commands/github.md](commands/github.md).
 
 ---
 
-## The code, in reading order
-
-Every file is numbered in its docstring. `hr_assistant/`: **01** config ·
-**02** prompts · **03** logging · **04** document_loader · **05** processor ·
-**06** splitter · **07** embeddings · **08** vector_store · **09** ingestion ·
-**10** reranker · **11** tools · **12** llm · **13** agent · **14** pipeline ·
-**15** tracing. Entry scripts: **16** `ingest.py` · **17** `main.py` ·
-**18** `app.py` · **19** `studio_graph.py`.
-
-## The scripts
-
-| Command | What it does |
-|---|---|
-| `uv run python ingest.py` | Ingest the corpus: local `data/` → GCS raw → GCS processed (pdf/docx/pptx parsed once) → Qdrant. Builds **both** collections. `--force` to rebuild, `--hr-only` / `--noisy-only` to limit scope. |
-| `uv run python main.py` | CLI demo — a few questions through the agent. Bootstraps ingestion on first run if needed. |
-| `uv run streamlit run app.py` | The chat UI. One conversation thread per browser session. |
-| `uv run python -m hr_assistant.tracing` | Check that LangSmith tracing is wired up. |
-| `uv run langgraph dev` | Open LangGraph Studio on the agent graph. |
-
-## How it works
+## Repository map
 
 ```
-question
-  -> agent (LangChain create_agent + InMemorySaver memory)
-       -> search_hr_policy tool
-            -> Qdrant hybrid retrieve (wide: RERANK_CANDIDATE_K)
-            -> Jina reranker (narrow: TOP_K_RESULTS)  ->  cited chunks
-  -> Gemini writes the answer from those chunks  ->  answer + citation
+MyHR/
+  ingest.py                 # run from here: python ingest.py
+  data/                     # HR .txt + data/noise/
+  Images/                   # architecture diagrams (this README)
+  myhr_rag/
+    config.py               # 01  .env
+    prompts.py              # 02  system prompt
+    logging_config.py       # 03
+    document_loader.py      # 04  GCS → LangChain Documents
+    processor.py            # 05  pdf/docx/pptx → JSON
+    splitter.py             # 06  chunks 500 / 60
+    embeddings.py           # 07  Jina
+    vector_store.py         # 08  Qdrant hybrid
+    ingestion.py            # 09  orchestrates 04–08
+    SEQUENCE.md             # numbered reading order
+  commands/                 # gcloud, git, provisioning notes
 ```
 
-Ingestion is a **separate** step — `hr_assistant/ingestion.py` is the only
-writer to Qdrant. Everything else connects to what it built.
+Reading order for the Python package: [myhr_rag/SEQUENCE.md](myhr_rag/SEQUENCE.md).
 
-## Documentation
+---
 
-Read `docs/` in order — [01 Overview](docs/01-overview.md)–[08 The Agent](docs/08-the-agent.md)
-for this stage. [commands/commands-basic-rag.md](commands/commands-basic-rag.md)
-has every provisioning command.
+## Stack
+
+Python 3.12 · **uv** · LangChain / LangGraph · Vertex AI Gemini ·
+Google Cloud Storage · Qdrant Cloud · Jina embeddings + reranker · Streamlit
+(planned on this branch) · LangSmith (optional)

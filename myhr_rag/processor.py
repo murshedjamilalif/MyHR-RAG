@@ -49,7 +49,7 @@ def _parse_pptx(raw_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
-_PARSERS = {".pdf": _parse_pdf, ".docx": _parse_docx, ".pptx": _parse_pptx}
+_PARSERS = {".pdf": _parse_pdf, ".docx": _parse_docx, ".pptx": _parse_pptx}   
 
 
 def parse_blob(blob) -> str:
